@@ -1,7 +1,7 @@
 /*
  * ndpi_main.h
  *
- * Copyright (C) 2011-18 - ntop.org
+ * Copyright (C) 2011-21 - ntop.org
  *
  * This file is part of nDPI, an open source deep packet inspection
  * library based on the OpenDPI and PACE technology by ipoque GmbH
@@ -30,6 +30,10 @@
 #include "ndpi_typedefs.h"
 #include "ndpi_api.h"
 #include "ndpi_protocols.h"
+
+/* used by ndpi_set_proto_subprotocols */
+#define NDPI_PROTOCOL_NO_MORE_SUBPROTOCOLS (-1)
+#define NDPI_PROTOCOL_MATCHED_BY_CONTENT (-2)
 
 #ifdef __cplusplus
 extern "C" {
@@ -95,11 +99,11 @@ extern "C" {
 				       struct ndpi_flow_struct *flow,
 				       ndpi_protocol_category_t protocol_category);
 
+  extern void ndpi_set_proto_subprotocols(struct ndpi_detection_module_struct *ndpi_mod,
+				      int protoId, ...);
+
   extern void ndpi_set_proto_defaults(struct ndpi_detection_module_struct *ndpi_mod,
-				      ndpi_protocol_breed_t protoBreed, u_int16_t protoId,
-				      u_int8_t can_have_a_subprotocol,
-				      u_int16_t tcp_alias_protoId[2],
-				      u_int16_t udp_alias_protoId[2], char *protoName,
+				      ndpi_protocol_breed_t protoBreed, u_int16_t protoId, char *protoName,
 				      ndpi_protocol_category_t protoCategory,
 				      ndpi_port_range *tcpDefPorts,
 				      ndpi_port_range *udpDefPorts);
@@ -112,10 +116,10 @@ extern "C" {
   extern void ndpi_packet_src_ip_get(const struct ndpi_packet_struct *packet, ndpi_ip_addr_t * ip);
   extern void ndpi_packet_dst_ip_get(const struct ndpi_packet_struct *packet, ndpi_ip_addr_t * ip);
 
-  extern char *ndpi_get_ip_string(struct ndpi_detection_module_struct *ndpi_struct,
-				  const ndpi_ip_addr_t * ip);
-  extern char *ndpi_get_packet_src_ip_string(struct ndpi_detection_module_struct *ndpi_struct,
-					     const struct ndpi_packet_struct *packet);
+  extern int ndpi_parse_ip_string(const char *ip_str, ndpi_ip_addr_t *parsed_ip);
+  extern char *ndpi_get_ip_string(const ndpi_ip_addr_t * ip, char *buf, u_int buf_len);
+  extern u_int8_t ndpi_is_ipv6(const ndpi_ip_addr_t *ip);
+
   extern char* ndpi_get_proto_by_id(struct ndpi_detection_module_struct *ndpi_mod, u_int id);
   u_int16_t ndpi_get_proto_by_name(struct ndpi_detection_module_struct *ndpi_mod, const char *name);
 
@@ -124,15 +128,9 @@ extern "C" {
 					  u_int8_t proto, u_int16_t sport, u_int16_t dport,
 					  u_int8_t *user_defined_proto);
 
-  extern u_int8_t ndpi_is_proto(ndpi_protocol p, u_int16_t proto);
+  extern u_int8_t ndpi_is_proto(ndpi_protocol proto, u_int16_t p);
 
   extern u_int16_t ndpi_get_lower_proto(ndpi_protocol p);
-  extern int ndpi_get_protocol_id_master_proto(struct ndpi_detection_module_struct *ndpi_struct,
-					       u_int16_t protocol_id,
-					       u_int16_t** tcp_master_proto,
-					       u_int16_t** udp_master_proto);
-  #/* NDPI_PROTOCOL_NETBIOS */
-  int ndpi_netbios_name_interpret(char *in, char *out, u_int out_len);
   
 #ifdef NDPI_ENABLE_DEBUG_MESSAGES
   void ndpi_debug_get_last_log_function_line(struct ndpi_detection_module_struct *ndpi_struct,
@@ -150,6 +148,10 @@ extern "C" {
 #define ndpi_match_strprefix(payload, payload_len, str)			\
   ndpi_match_prefix((payload), (payload_len), (str), (sizeof(str)-1))
 
+  int ndpi_handle_ipv6_extension_headers(struct ndpi_detection_module_struct *ndpi_str,
+					 const u_int8_t ** l4ptr, u_int16_t * l4len,
+					 u_int8_t * nxt_hdr);
+  void ndpi_set_risk(struct ndpi_flow_struct *flow, ndpi_risk_enum r);
 #ifdef __cplusplus
 }
 #endif
