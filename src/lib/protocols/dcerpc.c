@@ -26,44 +26,431 @@
 #define NDPI_CURRENT_PROTO NDPI_PROTOCOL_DCERPC
 
 #include "ndpi_api.h"
+#include "ndpi_private.h"
+#include <stdbool.h>
 
+#define DCERPC_HEADER_LEN 16
+#define DCERPC_MAX_REASM_LEN 65535
+
+
+#define DCERPC_PKT_BIND 11
+
+#define DCERPC_CL_HEADER_LEN       80
+#define DCERPC_CL_OBJECT_OFFSET     8
+#define DCERPC_CL_INTERFACE_OFFSET 24
+
+/* Interface UUIDs used for remote administration, in canonical (big endian) byte order */
+static const u_int8_t dcerpc_remote_admin_uuids[][16] = {
+  /* MS-SCMR (svcctl): 367abb81-9844-35f1-ad32-98f038001003 */
+  { 0x36, 0x7a, 0xbb, 0x81, 0x98, 0x44, 0x35, 0xf1, 0xad, 0x32, 0x98, 0xf0, 0x38, 0x00, 0x10, 0x03 },
+  /* MS-RRP (winreg): 338cd001-2244-31f1-aaaa-900038001003 */
+  { 0x33, 0x8c, 0xd0, 0x01, 0x22, 0x44, 0x31, 0xf1, 0xaa, 0xaa, 0x90, 0x00, 0x38, 0x00, 0x10, 0x03 },
+  /* MS-TSCH (ITaskSchedulerService): 86d35949-83c9-4044-b424-db363231fd0c */
+  { 0x86, 0xd3, 0x59, 0x49, 0x83, 0xc9, 0x40, 0x44, 0xb4, 0x24, 0xdb, 0x36, 0x32, 0x31, 0xfd, 0x0c },
+  /* MS-TSCH (ATSvc): 1ff70682-0a51-30e8-076d-740be8cee98b */
+  { 0x1f, 0xf7, 0x06, 0x82, 0x0a, 0x51, 0x30, 0xe8, 0x07, 0x6d, 0x74, 0x0b, 0xe8, 0xce, 0xe9, 0x8b },
+  /* MS-TSCH (SASec): 378e52b0-c0a9-11cf-822d-00aa0051e40f */
+  { 0x37, 0x8e, 0x52, 0xb0, 0xc0, 0xa9, 0x11, 0xcf, 0x82, 0x2d, 0x00, 0xaa, 0x00, 0x51, 0xe4, 0x0f },
+};
+
+/* Copy the UUID at payload[offset] (16 bytes, already bound-checked by the caller) in canonical
+   (big endian) byte order, according to the integer representation in the DCERPC header.
+   The data representation field is at offset 4 in both connection oriented and connectionless headers */
+static void dcerpc_get_uuid(const u_int8_t *payload, u_int32_t offset, u_int8_t uuid[16])
+{
+  memcpy(uuid, &payload[offset], 16);
+  if(payload[4] & 0x10) { /* Little endian: swap the first three UUID fields */
+    u_int8_t t;
+
+    t = uuid[0]; uuid[0] = uuid[3]; uuid[3] = t;
+    t = uuid[1]; uuid[1] = uuid[2]; uuid[2] = t;
+    t = uuid[4]; uuid[4] = uuid[5]; uuid[5] = t;
+    t = uuid[6]; uuid[6] = uuid[7]; uuid[7] = t;
+  }
+}
+
+/* EPM (Endpoint Mapper) interface: e1af8308-5d1f-11c9-91a4-08002b14a0fa */
+static const u_int8_t dcerpc_epm_uuid[16] =
+  { 0xe1, 0xaf, 0x83, 0x08, 0x5d, 0x1f, 0x11, 0xc9, 0x91, 0xa4, 0x08, 0x00, 0x2b, 0x14, 0xa0, 0xfa };
+
+/* PROFINET/IO object UUID: dea00000-6c97-11d1-8271-<instance><device id><vendor id> */
+static const u_int8_t pnio_object_uuid_prefix[10] =
+  { 0xde, 0xa0, 0x00, 0x00, 0x6c, 0x97, 0x11, 0xd1, 0x82, 0x71 };
+
+/* PROFINET/IO interfaces: dea0000X-6c97-11d1-8271-00a02442df7d with X = 1 (Device),
+   2 (Controller), 3 (Supervisor), 4 (ParameterServer). Only the common tail, in both byte orders */
+static const u_int8_t pnio_interface_uuid_tail_be[12] =
+  { 0x6c, 0x97, 0x11, 0xd1, 0x82, 0x71, 0x00, 0xa0, 0x24, 0x42, 0xdf, 0x7d };
+static const u_int8_t pnio_interface_uuid_tail_le[12] =
+  { 0x97, 0x6c, 0xd1, 0x11, 0x82, 0x71, 0x00, 0xa0, 0x24, 0x42, 0xdf, 0x7d };
+
+/* Is the canonical (big endian) UUID a PROFINET/IO interface? */
+static bool is_pnio_interface_uuid(const u_int8_t uuid[16])
+{
+  return uuid[0] == 0xde && uuid[1] == 0xa0 && uuid[2] == 0x00 &&
+         uuid[3] >= 0x01 && uuid[3] <= 0x04 &&
+         memcmp(&uuid[4], pnio_interface_uuid_tail_be, sizeof(pnio_interface_uuid_tail_be)) == 0;
+}
+
+/* Look for a PROFINET/IO interface UUID, in the given byte order, anywhere in the buffer */
+static bool find_pnio_interface_uuid(const u_int8_t *buf, u_int16_t len, bool little_endian)
+{
+  const u_int8_t *tail = little_endian ? pnio_interface_uuid_tail_le : pnio_interface_uuid_tail_be;
+  const u_int8_t *p = buf, *end = buf + len, *m;
+  u_int8_t uuid[16];
+
+  while(p + 16 <= end) {
+    m = (const u_int8_t *)ndpi_memmem(p + 4, end - (p + 4), tail, 12);
+    if(m == NULL)
+      return false;
+    memcpy(uuid, m - 4, 4);
+    if(little_endian) {
+      u_int8_t t;
+
+      t = uuid[0]; uuid[0] = uuid[3]; uuid[3] = t;
+      t = uuid[1]; uuid[1] = uuid[2]; uuid[2] = t;
+    }
+    memcpy(&uuid[4], pnio_interface_uuid_tail_be, 12);
+    if(is_pnio_interface_uuid(uuid))
+      return true;
+    p = m - 3; /* Next search starts from m + 1 */
+  }
+  return false;
+}
+
+enum dcerpc_cl_kind {
+  DCERPC_CL_GENERIC = 0,
+  DCERPC_CL_EPM,
+  DCERPC_CL_PNIO,
+};
+
+/* Classify a (valid) connectionless DCERPC packet */
+static enum dcerpc_cl_kind dcerpc_cl_classify(struct ndpi_packet_struct *packet)
+{
+  const u_int8_t *payload = packet->payload;
+  u_int8_t object[16], itf[16];
+
+  dcerpc_get_uuid(payload, DCERPC_CL_OBJECT_OFFSET, object);
+  dcerpc_get_uuid(payload, DCERPC_CL_INTERFACE_OFFSET, itf);
+
+  if(memcmp(object, pnio_object_uuid_prefix, sizeof(pnio_object_uuid_prefix)) == 0 ||
+     is_pnio_interface_uuid(itf))
+    return DCERPC_CL_PNIO;
+
+  if(memcmp(itf, dcerpc_epm_uuid, sizeof(dcerpc_epm_uuid)) == 0) {
+    /*
+      EPM lookup for a PROFINET/IO interface (request) or EPM entries with PROFINET/IO
+      towers (response). The UUID in the request follows the header data representation,
+      while the UUIDs in the tower floors are always little endian: check both
+    */
+    if(find_pnio_interface_uuid(&payload[DCERPC_CL_HEADER_LEN],
+                                packet->payload_packet_len - DCERPC_CL_HEADER_LEN, true) ||
+       find_pnio_interface_uuid(&payload[DCERPC_CL_HEADER_LEN],
+                                packet->payload_packet_len - DCERPC_CL_HEADER_LEN, false))
+      return DCERPC_CL_PNIO;
+    return DCERPC_CL_EPM;
+  }
+
+  return DCERPC_CL_GENERIC;
+}
+
+/* Does this (connection oriented) BIND request ask for a remote administration interface? */
+static bool is_remote_admin_bind(struct ndpi_packet_struct *packet)
+{
+  const u_int8_t *payload = packet->payload;
+  u_int16_t payload_len = packet->payload_packet_len;
+  u_int8_t num_ctx, i, j, uuid[16];
+  u_int32_t offset;
+
+  if(payload_len < 28 || payload[0] != 0x05 || payload[2] != DCERPC_PKT_BIND)
+    return false;
+
+  num_ctx = payload[24];
+  offset = 28;
+  for(i = 0; i < num_ctx; i++) {
+    /* Context id (2), num transfer syntaxes (1), reserved (1), abstract syntax (16 + 4), transfer syntaxes (20 each) */
+    if(offset + 24 > payload_len)
+      break;
+
+    dcerpc_get_uuid(payload, offset + 4, uuid);
+
+    for(j = 0; j < sizeof(dcerpc_remote_admin_uuids) / sizeof(dcerpc_remote_admin_uuids[0]); j++) {
+      if(memcmp(uuid, dcerpc_remote_admin_uuids[j], sizeof(uuid)) == 0)
+        return true;
+    }
+
+    offset += 24 + 20 * payload[offset + 2];
+  }
+
+  return false;
+}
+
+static bool is_connectionless_dcerpc(struct ndpi_packet_struct *packet);
+
+static void ndpi_int_profinet_io_add_connection(struct ndpi_detection_module_struct *ndpi_struct,
+                                                struct ndpi_flow_struct *flow)
+{
+  NDPI_LOG_INFO(ndpi_struct, "found PROFINET/IO over DCERPC\n");
+  ndpi_set_detected_protocol(ndpi_struct, &flow->core, NDPI_PROTOCOL_PROFINET_IO, NDPI_PROTOCOL_DCERPC, NDPI_CONFIDENCE_DPI);
+}
+
+/*
+  PROFINET/IO (CM) devices also expose the Endpoint Mapper on the same UDP port: the
+  PROFINET/IO calls might follow, on the same 5-tuple, an EPM exchange which doesn't
+  mention any PROFINET/IO interface
+*/
+static int ndpi_search_dcerpc_cl_extra(struct ndpi_detection_module_struct *ndpi_struct,
+                                       struct ndpi_flow_struct *flow)
+{
+  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
+
+  if(is_connectionless_dcerpc(packet) &&
+     dcerpc_cl_classify(packet) == DCERPC_CL_PNIO) {
+    ndpi_int_profinet_io_add_connection(ndpi_struct, flow);
+    /* The category has already been set by the (generic) DCERPC classification: update it */
+    if(flow->core.category == ndpi_struct->proto_defaults[NDPI_PROTOCOL_DCERPC].protoCategory)
+      flow->core.category = NDPI_PROTOCOL_CATEGORY_UNSPECIFIED;
+    fill_protocol_category_and_breed(ndpi_struct, flow);
+    return 0; /* Done */
+  }
+  return 1; /* Keep looking */
+}
 
 static void ndpi_int_dcerpc_add_connection(struct ndpi_detection_module_struct
 					     *ndpi_struct, struct ndpi_flow_struct *flow)
 {
-  ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_DCERPC, NDPI_PROTOCOL_UNKNOWN);
+  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
+
+  /* PROFINET/IO is based on connectionless DCERPC */
+  if(packet->udp != NULL && is_proto_enabled(ndpi_struct, NDPI_PROTOCOL_PROFINET_IO)) {
+    switch(dcerpc_cl_classify(packet)) {
+    case DCERPC_CL_PNIO:
+      ndpi_int_profinet_io_add_connection(ndpi_struct, flow);
+      return;
+    case DCERPC_CL_EPM:
+      ndpi_set_detected_protocol(ndpi_struct, &flow->core, NDPI_PROTOCOL_DCERPC, NDPI_PROTOCOL_UNKNOWN, NDPI_CONFIDENCE_DPI);
+      /* Look for PROFINET/IO in the next packets */
+      if(flow->core.extra_packets_func == NULL &&
+         ndpi_struct->cfg.dcerpc_max_packets_extra_dissection > 0) {
+        flow->core.max_extra_packets_to_check = ndpi_struct->cfg.dcerpc_max_packets_extra_dissection;
+        flow->core.extra_packets_func = ndpi_search_dcerpc_cl_extra;
+      }
+      return;
+    case DCERPC_CL_GENERIC:
+      break;
+    }
+  }
+
+  if(packet->tcp != NULL && is_remote_admin_bind(packet)) {
+    /*
+      Remote administration via svcctl/winreg/task scheduler interfaces. Note that this
+      traffic is generated not only by PowerShell but also by sc.exe, reg.exe,
+      PsExec, Impacket and by many management/monitoring tools: we report it
+      as PowerShell anyway
+    */
+    NDPI_LOG_INFO(ndpi_struct, "found PowerShell over DCERPC\n");
+    ndpi_set_detected_protocol(ndpi_struct, &flow->core, NDPI_PROTOCOL_POWERSHELL, NDPI_PROTOCOL_DCERPC, NDPI_CONFIDENCE_DPI);
+    return;
+  }
+
+  ndpi_set_detected_protocol(ndpi_struct, &flow->core, NDPI_PROTOCOL_DCERPC, NDPI_PROTOCOL_UNKNOWN, NDPI_CONFIDENCE_DPI);
 }
 
-void ndpi_search_dcerpc(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow)
+static bool is_connection_oriented_dcerpc(struct ndpi_packet_struct *packet)
 {
-  struct ndpi_packet_struct *packet = &flow->packet;
-
-  NDPI_LOG_DBG(ndpi_struct, "search DCERPC\n");
-
   if((packet->tcp != NULL)
      && (packet->payload_packet_len >= 64)
      && (packet->payload[0] == 0x05) /* version 5 */
      && (packet->payload[2] < 16) /* Packet type */
 		 && (((packet->payload[9]<<8) | packet->payload[8]) == packet->payload_packet_len) /* Packet Length */
      ) {
+    return true;
+  }
+  return false;
+}
+
+static bool is_connectionless_dcerpc(struct ndpi_packet_struct *packet)
+{
+  u_int16_t fragment_len;
+  
+  if (packet->udp == NULL)
+    return false;
+  if (packet->payload_packet_len < DCERPC_CL_HEADER_LEN)
+    return false;
+  if (packet->payload[0] != 0x04) /* type must be equal to 4 */
+    return false;
+  if (packet->payload[1] > 10) /* must be <= CANCEL ACK or it's not connectionless DCE/RPC */
+    return false;
+  if (packet->payload[3] & 0xFC) /* flags2: bit 3:8 are reserved for future use and must be set to 0 */
+    return false;
+  if (packet->payload[4] & 0xEE) /* neither big endian nor little endian */
+    return false;
+  if (packet->payload[5] > 3) /* invalid floating point type */
+    return false;
+
+  if(packet->payload[4] & 0x10)
+    fragment_len = (packet->payload[75] << 8) + packet->payload[74]; /* Little endian */
+  else
+    fragment_len = (packet->payload[74] << 8) + packet->payload[75]; /* Big endian */
+
+  if(packet->payload_packet_len != (fragment_len + DCERPC_CL_HEADER_LEN))
+    return false; /* Too short or too long, bot RPC */
+  
+  return true;
+}
+
+static void dcerpc_tcp_reasm_free_dir(struct ndpi_dcerpc_tcp_reasm *reasm)
+{
+  if(reasm->buf != NULL)
+    ndpi_free(reasm->buf);
+  reasm->buf = NULL;
+  reasm->cur_len = 0;
+  reasm->msg_len = 0;
+  reasm->next_seq = 0;
+}
+
+static int dcerpc_tcp_reasm_append(struct ndpi_dcerpc_tcp_reasm *reasm,
+                                   const u_int8_t *data, u_int16_t len)
+{
+  u_int32_t new_len;
+  u_int8_t *new_buf;
+
+  if(len == 0)
+    return 0;
+  new_len = (u_int32_t)reasm->cur_len + len;
+  if(new_len > DCERPC_MAX_REASM_LEN)
+    return -1;
+  if(reasm->buf == NULL) {
+    reasm->buf = ndpi_malloc(new_len);
+    if(reasm->buf == NULL)
+      return -1;
+    memcpy(reasm->buf, data, len);
+  } else {
+    new_buf = (u_int8_t *)ndpi_realloc(reasm->buf, new_len);
+    if(new_buf == NULL)
+      return -1;
+    reasm->buf = new_buf;
+    memcpy(&reasm->buf[reasm->cur_len], data, len);
+  }
+  reasm->cur_len = (u_int16_t)new_len;
+  return 0;
+}
+
+static bool dcerpc_tcp_start_candidate(struct ndpi_packet_struct *packet)
+{
+  return packet->tcp != NULL && packet->payload_packet_len > 0 &&
+         packet->payload[0] == 0x05;
+}
+
+static bool dcerpc_tcp_header_prefix_valid(const u_int8_t *payload, u_int16_t payload_len)
+{
+  if(payload_len >= 1 && payload[0] != 0x05)
+    return false;
+  if(payload_len >= 3 && payload[2] >= 16)
+    return false;
+  if(payload_len >= 4 && (payload[3] & 0xF0))
+    return false;
+  return true;
+}
+
+static bool dcerpc_tcp_get_fragment_len(const u_int8_t *payload, u_int16_t payload_len,
+                                        u_int16_t *fragment_len)
+{
+  if(payload_len < 10 || !dcerpc_tcp_header_prefix_valid(payload, payload_len))
+    return false;
+
+  if(payload[4] & 0x10) /* Little endian */
+    *fragment_len = ((u_int16_t)payload[9] << 8) | payload[8];
+  else
+    *fragment_len = ((u_int16_t)payload[8] << 8) | payload[9];
+
+  return *fragment_len >= DCERPC_HEADER_LEN;
+}
+
+static int dcerpc_tcp_process(struct ndpi_detection_module_struct *ndpi_struct,
+                              struct ndpi_flow_struct *flow)
+{
+  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
+  struct ndpi_dcerpc_tcp_reasm *reasm;
+  const u_int8_t *original_payload = packet->payload;
+  u_int16_t original_len = packet->payload_packet_len;
+  u_int32_t seq = ntohl(packet->tcp->seq);
+  u_int16_t fragment_len;
+
+  if(flow->core.dcerpc_tcp_reasm == NULL) {
+    if(!dcerpc_tcp_header_prefix_valid(original_payload, original_len))
+      return -1;
+    /* Complete messages are handled by the normal fast path above. */
+    if(original_len >= 10) {
+      if(!dcerpc_tcp_get_fragment_len(original_payload, original_len, &fragment_len))
+        return -1;
+      if(fragment_len <= original_len)
+        return -1;
+    }
+
+    flow->core.dcerpc_tcp_reasm = ndpi_calloc(1, sizeof(*flow->core.dcerpc_tcp_reasm));
+    if(flow->core.dcerpc_tcp_reasm == NULL)
+      return -1;
+  }
+
+  reasm = &flow->core.dcerpc_tcp_reasm->dir[packet->packet_direction];
+  if(reasm->cur_len == 0 && !dcerpc_tcp_header_prefix_valid(original_payload, original_len))
+    goto invalid;
+  if(reasm->cur_len > 0 && seq != reasm->next_seq)
+    return 0;
+  if(dcerpc_tcp_reasm_append(reasm, original_payload, original_len) < 0)
+    goto invalid;
+  reasm->next_seq = seq + original_len;
+
+  if(reasm->cur_len < 10)
+    return 0;
+  if(!dcerpc_tcp_get_fragment_len(reasm->buf, reasm->cur_len, &fragment_len))
+    goto invalid;
+  reasm->msg_len = fragment_len;
+  if(reasm->msg_len > reasm->cur_len)
+    return 0;
+
+  packet->payload = reasm->buf;
+  packet->payload_packet_len = reasm->msg_len;
+  if(is_connection_oriented_dcerpc(packet))
+    ndpi_int_dcerpc_add_connection(ndpi_struct, flow);
+  packet->payload = original_payload;
+  packet->payload_packet_len = original_len;
+  dcerpc_tcp_reasm_free_dir(reasm);
+  return flow->core.detected_protocol_stack[0] == NDPI_PROTOCOL_DCERPC ? 1 : 0;
+
+invalid:
+  dcerpc_tcp_reasm_free_dir(reasm);
+  return -1;
+}
+
+static void ndpi_search_dcerpc(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow)
+{
+  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
+
+  NDPI_LOG_DBG(ndpi_struct, "search DCERPC\n");
+  if (is_connection_oriented_dcerpc(packet) || is_connectionless_dcerpc(packet)) {
     NDPI_LOG_INFO(ndpi_struct, "found DCERPC\n");
     ndpi_int_dcerpc_add_connection(ndpi_struct, flow);
     return;
   }
 
-  if(packet->payload_packet_len>1)
-    NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+  if(packet->tcp != NULL && (flow->core.dcerpc_tcp_reasm != NULL ||
+                             dcerpc_tcp_start_candidate(packet))) {
+    if(dcerpc_tcp_process(ndpi_struct, flow) >= 0)
+      return;
+  }
+
+  if(packet->payload_packet_len > 1)
+    NDPI_EXCLUDE_DISSECTOR(ndpi_struct, flow);
 }
 
 
-void init_dcerpc_dissector(struct ndpi_detection_module_struct *ndpi_struct, u_int32_t *id, NDPI_PROTOCOL_BITMASK *detection_bitmask)
+void init_dcerpc_dissector(struct ndpi_detection_module_struct *ndpi_struct)
 {
-  ndpi_set_bitmask_protocol_detection("DCE_RPC", ndpi_struct, detection_bitmask, *id,
-				      NDPI_PROTOCOL_DCERPC,
-				      ndpi_search_dcerpc,
-				      NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD_WITHOUT_RETRANSMISSION,
-				      SAVE_DETECTION_BITMASK_AS_UNKNOWN,
-				      ADD_TO_DETECTION_BITMASK);
-  *id += 1;
+  ndpi_register_dissector("DCERPC", ndpi_struct,
+                     ndpi_search_dcerpc,
+                     NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_OR_UDP_WITH_PAYLOAD_WITHOUT_RETRANSMISSION,
+                     DISSECTOR_LICENSE_LGPL,
+                     1, NDPI_PROTOCOL_DCERPC);
 }
-

@@ -1,7 +1,7 @@
 /*
  * mssql.c
  *
- * Copyright (C) 2016-18 - ntop.org
+ * Copyright (C) 2016-22 - ntop.org
  *
  * This file is part of nDPI, an open source deep packet inspection
  * library based on the OpenDPI and PACE technology by ipoque GmbH
@@ -27,6 +27,7 @@
 #define NDPI_CURRENT_PROTO NDPI_PROTOCOL_MSSQL_TDS
 
 #include "ndpi_api.h"
+#include "ndpi_private.h"
 
 
 struct tds_packet_header {
@@ -41,22 +42,27 @@ struct tds_packet_header {
 static void ndpi_int_mssql_tds_add_connection(struct ndpi_detection_module_struct
 					  *ndpi_struct, struct ndpi_flow_struct *flow)
 {
-  ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_MSSQL_TDS, NDPI_PROTOCOL_UNKNOWN);
+  ndpi_set_detected_protocol(ndpi_struct, &flow->core, NDPI_PROTOCOL_MSSQL_TDS, NDPI_PROTOCOL_UNKNOWN, NDPI_CONFIDENCE_DPI);
 }
 
-void ndpi_search_mssql_tds(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow)
+static void ndpi_search_mssql_tds(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow)
 {
-  struct ndpi_packet_struct *packet = &flow->packet;
+  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
   struct tds_packet_header *h = (struct tds_packet_header*) packet->payload;
 
   NDPI_LOG_DBG(ndpi_struct, "search mssql_tds\n");
 
-  if(packet->payload_packet_len < sizeof(struct tds_packet_header)) {
-    NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+  if((packet->payload_packet_len < sizeof(struct tds_packet_header))
+     /*
+       The TPKT protocol used by ISO 8072 (on port 102) is similar
+       to this potocol and it can cause false positives 
+     */
+     || (packet->tcp->dest == ntohs(102))) {
+    NDPI_EXCLUDE_DISSECTOR(ndpi_struct, flow);
     return;
   }
   
-  if((h->type >= 1 && h->type <= 8) || (h->type >= 14 && h->type <= 18)) {
+  if((h->number > 0 && h->type >= 1 && h->type <= 8) || (h->type >= 14 && h->type <= 18)) {
     if(h->status == 0x00 || h->status == 0x01 || h->status == 0x02 || h->status == 0x04 || h->status == 0x08 || h->status == 0x09 || h->status == 0x10) {
       if(ntohs(h->length) == packet->payload_packet_len && h->window == 0x00) {
 	NDPI_LOG_INFO(ndpi_struct, "found mssql_tds\n");
@@ -66,18 +72,15 @@ void ndpi_search_mssql_tds(struct ndpi_detection_module_struct *ndpi_struct, str
     }
   }
   
-  NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+  NDPI_EXCLUDE_DISSECTOR(ndpi_struct, flow);
 }
 
 
-void init_mssql_tds_dissector(struct ndpi_detection_module_struct *ndpi_struct, u_int32_t *id, NDPI_PROTOCOL_BITMASK *detection_bitmask)
+void init_mssql_tds_dissector(struct ndpi_detection_module_struct *ndpi_struct)
 {
-  ndpi_set_bitmask_protocol_detection("MsSQL_TDS", ndpi_struct, detection_bitmask, *id,
-				      NDPI_PROTOCOL_MSSQL_TDS,
-				      ndpi_search_mssql_tds,
-				      NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD_WITHOUT_RETRANSMISSION,
-				      SAVE_DETECTION_BITMASK_AS_UNKNOWN,
-				      ADD_TO_DETECTION_BITMASK);
-
-  *id += 1;
+  ndpi_register_dissector("MsSQL_TDS", ndpi_struct,
+                     ndpi_search_mssql_tds,
+                     NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD_WITHOUT_RETRANSMISSION,
+                      DISSECTOR_LICENSE_LGPL,
+                      1, NDPI_PROTOCOL_MSSQL_TDS);
 }

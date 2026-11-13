@@ -3,12 +3,12 @@ Section: free
 Priority: optional
 Maintainer: Luca Deri <deri@ntop.org>
 Standards-Version: @NDPI_VERS@
-Build-Depends:
+Build-Depends: debhelper
 Build-Conflicts:
 
 Package: ndpi
 Architecture: @EXTN@
-Depends: libnuma1
+Depends: libnuma1 @GEOIP_DEP@
 Recommends:
 Suggests:
 Pre-Depends:

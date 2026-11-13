@@ -1,7 +1,7 @@
 /*
  * whoisdas.c
  *
- * Copyright (C) 2016-18 - ntop.org
+ * Copyright (C) 2016-22 - ntop.org
  *
  * nDPI is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -23,53 +23,46 @@
 #define NDPI_CURRENT_PROTO NDPI_PROTOCOL_WHOIS_DAS
 
 #include "ndpi_api.h"
+#include "ndpi_private.h"
 
 
-void ndpi_search_whois_das(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow)
+static void ndpi_search_whois_das(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow)
 {
-  struct ndpi_packet_struct *packet = &flow->packet;
+  struct ndpi_packet_struct *packet = &ndpi_struct->packet;
 
   NDPI_LOG_DBG(ndpi_struct, "search WHOIS/DAS\n");
   if(packet->tcp != NULL) {
     u_int16_t sport = ntohs(packet->tcp->source), dport = ntohs(packet->tcp->dest);
     
-    if(((sport == 43) || (dport == 43)) || ((sport == 4343) || (dport == 4343))) {
+    if((((sport == 43) || (dport == 43)) || ((sport == 4343) || (dport == 4343))) &&
+       packet->payload_packet_len > 2 &&
+       packet->payload[packet->payload_packet_len - 2] == '\r' &&
+       packet->payload[packet->payload_packet_len - 1] == '\n' &&
+       /* To avoid false positives with other cleartext protocol (i.e. mails).
+          This check is maybe not perfect, but WHOIS/DAS is not the most
+          important/used protocols nowadays
+        */
+       ndpi_is_valid_hostname((char * const)&packet->payload[0], packet->payload_packet_len - 2)) {
 
-      if(packet->payload_packet_len > 0) {
-	
-	u_int max_len = sizeof(flow->host_server_name) - 1;
-	u_int i, j;
+      ndpi_set_detected_protocol(ndpi_struct, &flow->core, NDPI_PROTOCOL_WHOIS_DAS, NDPI_PROTOCOL_UNKNOWN, NDPI_CONFIDENCE_DPI);
 
-	if(!ndpi_struct->disable_metadata_export) {
-	  for(i=strlen((const char *)flow->host_server_name), j=0; (i<max_len) && (j<packet->payload_packet_len); i++, j++) {
-	    if((packet->payload[j] == '\n') || (packet->payload[j] == '\r')) break;	  
-	    flow->host_server_name[i] = packet->payload[j];
-	  }
-	  
-	  flow->host_server_name[i] = '\0';
-	}
-	
-	flow->server_id = ((sport == 43) || (sport == 4343)) ? flow->src : flow->dst;
-	
-	NDPI_LOG_INFO(ndpi_struct, "[WHOIS/DAS] %s\n", flow->host_server_name);
-	ndpi_set_detected_protocol(ndpi_struct, flow, NDPI_PROTOCOL_WHOIS_DAS, NDPI_PROTOCOL_UNKNOWN);
-	return;
+      if((dport == 43) || (dport == 4343)) { /* Request */
+        ndpi_hostname_sni_set(flow, &packet->payload[0], packet->payload_packet_len - 2, NDPI_HOSTNAME_NORM_ALL); /* Skip \r\n */
+        if(flow->core.host_server_name) NDPI_LOG_INFO(ndpi_struct, "[WHOIS/DAS] %s\n", flow->core.host_server_name);
       }
+      return;
     }
   }
 
-  NDPI_EXCLUDE_PROTO(ndpi_struct, flow);
+  NDPI_EXCLUDE_DISSECTOR(ndpi_struct, flow);
 }
 
 
-void init_whois_das_dissector(struct ndpi_detection_module_struct *ndpi_struct, u_int32_t *id, NDPI_PROTOCOL_BITMASK *detection_bitmask)
+void init_whois_das_dissector(struct ndpi_detection_module_struct *ndpi_struct)
 {
-  ndpi_set_bitmask_protocol_detection("Whois-DAS", ndpi_struct, detection_bitmask, *id,
-				      NDPI_PROTOCOL_WHOIS_DAS,
-				      ndpi_search_whois_das,
-				      NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD_WITHOUT_RETRANSMISSION,
-				      SAVE_DETECTION_BITMASK_AS_UNKNOWN,
-				      ADD_TO_DETECTION_BITMASK); 
-
-  *id += 1;
+  ndpi_register_dissector("Whois-DA", ndpi_struct,
+                     ndpi_search_whois_das,
+                     NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD_WITHOUT_RETRANSMISSION,
+                     DISSECTOR_LICENSE_LGPL,
+                     1, NDPI_PROTOCOL_WHOIS_DAS);
 }

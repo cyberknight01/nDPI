@@ -1,9 +1,4 @@
-#!/bin/sh
-
-NDPI_MAJOR="2"
-NDPI_MINOR="7"
-NDPI_PATCH="0"
-NDPI_VERSION_SHORT="$NDPI_MAJOR.$NDPI_MINOR.$NDPI_PATCH"
+#!/usr/bin/env sh
 
 rm -f configure config.h config.h.in
 
@@ -12,37 +7,55 @@ AUTOMAKE=$(command -v automake)
 LIBTOOL=$(command -v libtool)
 LIBTOOLIZE=$(command -v libtoolize)
 AUTORECONF=$(command -v autoreconf)
+PKG_CONFIG=$(command -v pkg-config)
+MAKE=$(command -v make)
 
-if test -z $AUTOCONF; then
-    echo "autoconf is missing: please install it and try again"
-    exit
+if test -z "${AUTOCONF}"; then
+    echo "ERROR: autoconf is missing" >&2
+    echo "Please install autotools package (e.g., apt-get install autoconf)" >&2
+    exit 1
 fi
 
-if test -z $AUTOMAKE; then
-    echo "automake is missing: please install it and try again"
-    exit
+if test -z "${AUTOMAKE}"; then
+    echo "ERROR: automake is missing" >&2
+    echo "Please install automake package (e.g., apt-get install automake)" >&2
+    exit 1
 fi
 
-if test -z $LIBTOOL && test -z $LIBTOOLIZE ; then
-    echo "libtool and libtoolize is missing: please install it and try again"
-    exit
+if test -z "${LIBTOOL}" && test -z "${LIBTOOLIZE}"; then
+    echo "ERROR: libtool and libtoolize are both missing" >&2
+    echo "Please install libtool package (e.g., apt-get install libtool)" >&2
+    exit 1
 fi
 
-if test -z $AUTORECONF; then
-    echo "autoreconf is missing: please install it and try again"
-    exit
+if test -z "${AUTORECONF}"; then
+    echo "ERROR: autoreconf is missing" >&2
+    echo "Please install autoconf package (e.g., apt-get install autoconf)" >&2
+    exit 1
 fi
 
-cat configure.seed | sed \
-    -e "s/@NDPI_MAJOR@/$NDPI_MAJOR/g" \
-    -e "s/@NDPI_MINOR@/$NDPI_MINOR/g" \
-    -e "s/@NDPI_PATCH@/$NDPI_PATCH/g" \
-    -e "s/@NDPI_VERSION_SHORT@/$NDPI_VERSION_SHORT/g" \
-    > configure.ac
+if test -z "${PKG_CONFIG}"; then
+    echo "ERROR: pkg-config is missing" >&2
+    echo "Please install pkg-config package (e.g., apt-get install pkg-config)" >&2
+    exit 1
+fi
 
-autoreconf -ivf
-cat configure | sed "s/#define PACKAGE/#define NDPI_PACKAGE/g" | sed "s/#define VERSION/#define NDPI_VERSION/g"  > configure.tmp
-cat configure.tmp > configure
+if test -z "${MAKE}"; then
+    echo "ERROR: make is missing" >&2
+    echo "Please install make package (e.g., apt-get install make)" >&2
+    exit 1
+fi
 
-chmod +x configure
-./configure $*
+echo "Running autoreconf to generate build system..."
+autoreconf -ivf || {
+    echo "ERROR: autoreconf failed" >&2
+    echo "Please check that all autotools are properly installed" >&2
+    exit 1
+}
+
+echo "Build system generated successfully!"
+echo "You can now run: ./configure && make"
+
+#####
+# Don't call `configure` here!!!! It breaks out-of-tree builds
+#####
